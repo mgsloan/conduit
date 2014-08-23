@@ -102,20 +102,58 @@ import qualified Safe
 import qualified Data.Maybe
 #endif
 
+-- TODO:
+--
+-- * Should these new streamified producers should follow the pattern
+-- of enumFromTo?  Why does the RULE use streamSourcePure whereas the
+-- inline definition use streamSource?  Does it intentionally use ($)?
+
+-- * Is there a better way to do the rule for foldMap? The RULES is
+-- just a direct inliner.
+--
+-- * Are INLINE [2] pragmas intended instead of INLINE [0] ? Phase 2
+-- happens earlier, I think.
+
 -- | Generate a source from a seed value.
+--
+-- Subject to fusion
 --
 -- Since 0.4.2
 unfold :: Monad m
        => (b -> Maybe (a, b))
        -> b
        -> Producer m a
-unfold f =
+unfold = unfoldC
+{-# INLINE [0] unfold #-}
+{-# RULES "conduit: unstream unfold" forall x y.
+    unfold x y = unstream (streamConduit (unfoldC x y) (\_ -> unfoldS x y))
+  #-}
+
+unfoldC :: Monad m
+        => (b -> Maybe (a, b))
+        -> b
+        -> Producer m a
+unfoldC f =
     go
   where
     go seed =
         case f seed of
             Just (a, seed') -> yield a >> go seed'
             Nothing -> return ()
+{-# INLINE unfoldC #-}
+
+unfoldS :: Monad m
+        => (b -> Maybe (a, b))
+        -> b
+        -> Stream m a ()
+unfoldS f s0 =
+    Stream step (return s0)
+  where
+    step s = return $
+        case f s of
+            Nothing -> Stop ()
+            Just (x, s') -> Emit s' x
+{-# INLINE unfoldS #-}
 
 -- | A monadic unfold.
 --
@@ -133,8 +171,27 @@ unfoldM f =
             Just (a, seed') -> yield a >> go seed'
             Nothing -> return ()
 
+-- | Yield the values from the list.
+--
+-- Subject to fusion
 sourceList :: Monad m => [a] -> Producer m a
-sourceList = Prelude.mapM_ yield
+sourceList = sourceListC
+{-# INLINE [0] sourceList #-}
+{-# RULES "conduit: unstream sourceList" forall x.
+    sourceList x = unstream (streamConduit (sourceListC x) (\_ -> sourceListS x))
+  #-}
+
+sourceListC :: Monad m => [a] -> Producer m a
+sourceListC = Prelude.mapM_ yield
+{-# INLINE sourceListC #-}
+
+sourceListS :: Monad m => [a] -> Stream m a ()
+sourceListS xs =
+    Stream (return . step) (return xs)
+  where
+    step [] = Stop ()
+    step (x:xs) = Emit xs x
+{-# INLINE sourceListS #-}
 
 -- | Enumerate from a value to a final value, inclusive, via 'succ'.
 --
@@ -149,6 +206,7 @@ enumFromTo :: (Enum a, Prelude.Ord a, Monad m)
            => a
            -> a
            -> Producer m a
+--TODO: why isn't this enumFromToC?
 enumFromTo x y = unstream $ streamSource $ enumFromToS x y
 {-# INLINE [0] enumFromTo #-}
 {-# RULES "conduit: unstream enumFromTo" forall x y.
@@ -191,11 +249,31 @@ enumFromToS_int x0 y = x0 `seq` y `seq` Stream step (return x0)
   #-}
 
 -- | Produces an infinite stream of repeated applications of f to x.
+--
+-- Subject to fusion
+--
 iterate :: Monad m => (a -> a) -> a -> Producer m a
-iterate f =
+iterate = iterateC
+{-# INLINE [0] iterate #-}
+{-# RULES "conduit: unstream iterate" forall x y.
+    iterate x y = unstream (streamConduit (iterateC x y) (\_ -> iterateS x y))
+  #-}
+
+iterateC :: Monad m => (a -> a) -> a -> Producer m a
+iterateC f =
     go
   where
     go a = yield a >> go (f a)
+{-# INLINE iterateC #-}
+
+iterateS :: Monad m => (a -> a) -> a -> Stream m a ()
+iterateS f x =
+    Stream (return . step) (return x)
+  where
+    step x = Emit x' x
+      where
+        x' = f x
+{-# INLINE iterateS #-}
 
 -- | Replicate a single value the given number of times.
 --
@@ -372,14 +450,21 @@ connectFoldM (CI.ConduitM src0) f =
 
 -- | A monoidal strict left fold.
 --
+-- Subject to fusion
+--
 -- Since 0.5.3
 foldMap :: (Monad m, Monoid b)
         => (a -> b)
         -> Consumer a m b
 foldMap f =
-    fold combiner mempty
-  where
-    combiner accum = mappend accum . f
+    let combiner accum = mappend accum . f
+    in fold combiner mempty
+{-# INLINE [2] foldMap #-}
+{-# RULES "conduit: inline foldMap" forall f.
+    foldMap f =
+        let combiner accum = mappend accum . f
+        in fold combiner mempty
+  #-}
 
 -- | A monoidal strict left fold in a Monad.
 --
@@ -388,9 +473,14 @@ foldMapM :: (Monad m, Monoid b)
         => (a -> m b)
         -> Consumer a m b
 foldMapM f =
-    foldM combiner mempty
-  where
-    combiner accum = liftM (mappend accum) . f
+    let combiner accum = liftM (mappend accum) . f
+    in foldM combiner mempty
+{-# INLINE [2] foldMapM #-}
+{-# RULES "conduit: inline foldMapM" forall f.
+    foldMapM f =
+        let combiner accum = liftM (mappend accum) . f
+        in foldM combiner mempty
+  #-}
 
 -- | Apply the action to all values in the stream.
 --
@@ -719,9 +809,18 @@ consumeS (Stream step ms0) =
 
 -- | Grouping input according to an equality function.
 --
+-- Subject to fusion
+--
 -- Since 0.3.0
 groupBy :: Monad m => (a -> a -> Bool) -> Conduit a m [a]
-groupBy f =
+groupBy = groupByC
+{-# INLINE [0] groupBy #-}
+{-# RULES "conduit: unstream groupBy" forall f.
+        groupBy f = unstream (streamConduit (groupByC f) (groupByS f))
+  #-}
+
+groupByC :: Monad m => (a -> a -> Bool) -> Conduit a m [a]
+groupByC f =
     start
   where
     start = await >>= maybe (return ()) (loop id)
@@ -733,6 +832,31 @@ groupBy f =
             | f x y     = loop (rest . (y:)) x
             | otherwise = yield (x : rest []) >> loop id y
 
+data GroupByState m a
+    = GBStart
+    | GBLoop ([a] -> [a]) a
+    | GBDone
+
+groupByS :: Monad m => (a -> a -> Bool) -> Stream m a () -> Stream m [a] ()
+groupByS f (Stream step ms0) =
+    Stream step' (liftM (GBStart, ) ms0)
+  where
+    step' (GBStart, s) = do
+        res <- step s
+        return $ case res of
+            Stop () -> Stop ()
+            Skip s' -> Skip (GBStart, s')
+            Emit s' x0 -> Skip (GBLoop id x0, s')
+    step' (cur@(GBLoop rest x0), s) = do
+        res <- step s
+        return $ case res of
+            Stop () -> Emit (GBDone, s) (x0 : rest [])
+            Skip s' -> Skip (cur, s')
+            Emit s' x
+                | f x0 x -> Skip (GBLoop (rest . (x:)) x0, s')
+                | otherwise -> Emit (GBLoop id x, s') (x0 : rest [])
+    step' (GBDone, _) = return $ Stop ()
+{-# INLINE groupByS #-}
 
 -- | 'groupOn1' is similar to @groupBy id@
 --
@@ -844,14 +968,21 @@ sequence sink =
 
 #ifdef QUICKCHECK
 props = describe "Data.Conduit.List" $ do
-    qit "unfold" $
+    qit "unfoldC" $
         \(getBlind -> f, initial :: Int) ->
-            unfold f initial `checkInfiniteProducer`
+            unfoldC f initial `checkInfiniteProducer`
+            (Data.List.unfoldr f initial :: [Int])
+    qit "unfoldS" $
+        \(getBlind -> f, initial :: Int) ->
+            unfoldS f initial `checkInfiniteStreamProducer`
             (Data.List.unfoldr f initial :: [Int])
     todo "unfoldM"
-    qit "sourceList" $
+    qit "sourceListC" $
         \(xs :: [Int]) ->
-            sourceList xs `checkProducer` xs
+            sourceListC xs `checkProducer` xs
+    qit "sourceListS" $
+        \(xs :: [Int]) ->
+            sourceListS xs `checkStreamProducer` xs
     qit "enumFromToC" $
         \(fr :: Small Int, to :: Small Int) ->
             enumFromToC fr to `checkProducer`
@@ -864,9 +995,13 @@ props = describe "Data.Conduit.List" $ do
         \(getSmall -> fr :: Int, getSmall -> to :: Int) ->
             enumFromToS_int fr to `checkStreamProducer`
             Prelude.enumFromTo fr to
-    qit "iterate" $
+    qit "iterateC" $
         \(getBlind -> f, initial :: Int) ->
-            iterate f initial `checkInfiniteProducer`
+            iterateC f initial `checkInfiniteProducer`
+            Prelude.iterate f initial
+    qit "iterateS" $
+        \(getBlind -> f, initial :: Int) ->
+            iterateS f initial `checkInfiniteStreamProducer`
             Prelude.iterate f initial
     qit "replicateC" $
         \(getSmall -> n) ->
@@ -984,18 +1119,20 @@ todo n = it n $ True
 qit n f = it n $ property $ forAll arbitrary f
 
 checkProducer :: (Prelude.Show a, Eq a) => Source Identity a -> [a] -> Property
-checkProducer c l = runIdentity (c $$ consume) === l
+checkProducer c l =
+    runIdentity (c $$ consume) === l
 
 checkStreamProducer :: (Prelude.Show a, Eq a) => Stream Identity a () -> [a] -> Property
-checkStreamProducer s l = runIdentity (unstream (streamSource s) $$ consume) === l
+checkStreamProducer s l =
+    runIdentity (unstream (streamSource s) $$ consume) === l
 
 checkInfiniteProducer :: (Prelude.Show a, Eq a) => Source Identity a -> [a] -> Property
-checkInfiniteProducer s l = checkProducer (s $= isolate 10) (Prelude.take 10 l)
+checkInfiniteProducer s l =
+    checkProducer (s $= isolate 10) (Prelude.take 10 l)
 
-{- TODO
 checkInfiniteStreamProducer :: (Prelude.Show a, Eq a) => Stream Identity a () -> [a] -> Property
-checkInfiniteStreamProducer s l = checkStreamProducer (fuseStream s isolate) l
--}
+checkInfiniteStreamProducer s l =
+    runIdentity (unstream (streamSource s) $= isolate 10 $$ consume) === Prelude.take 10 l
 
 checkConsumer :: (Prelude.Show b, Eq b) => Consumer Int Identity b -> ([Int] -> b) -> Property
 checkConsumer c l = forAll arbitrary $ \xs ->
