@@ -16,6 +16,8 @@
 -- modules.
 module Data.Conduit.List
     ( -- * Sources
+      enumFromTo, fold, map, Producer', Consumer', Conduit', ConduitM' (..)
+{-
       sourceList
     , sourceNull
     , unfold
@@ -66,6 +68,7 @@ module Data.Conduit.List
     , concatMapAccumM
       -- * Misc
     , sequence
+-}
 #ifdef QUICKCHECK
     , props
 #endif
@@ -101,6 +104,128 @@ import qualified Data.Foldable
 import qualified Safe
 import qualified Data.Maybe
 #endif
+
+data ConduitM' i o m r = ConduitM'
+    !(ConduitM i o m r)
+    !(Maybe (Stream m i () -> Stream m o r))
+
+type Producer' m o = forall i. ConduitM' i o m ()
+
+type Consumer' i m r = forall o. ConduitM' i o m r
+
+type Conduit' i m o = ConduitM' i o m ()
+
+-- | Enumerate from a value to a final value, inclusive, via 'succ'.
+--
+-- This is generally more efficient than using @Prelude@\'s @enumFromTo@ and
+-- combining with @sourceList@ since this avoids any intermediate data
+-- structures.
+--
+-- Subject to fusion
+--
+-- Since 0.4.2
+enumFromTo :: (Enum a, Prelude.Ord a, Monad m)
+           => a
+           -> a
+           -> Producer' m a
+--TODO: why isn't this enumFromToC?
+enumFromTo x y = ConduitM' (enumFromToC x y) (Just (\_ -> enumFromToS x y))
+{-# INLINE enumFromTo #-}
+
+enumFromToC :: (Enum a, Prelude.Ord a, Monad m)
+            => a
+            -> a
+            -> Producer m a
+enumFromToC x0 y =
+    loop x0
+  where
+    loop x
+        | x Prelude.> y = return ()
+        | otherwise = yield x >> loop (Prelude.succ x)
+{-# INLINE enumFromToC #-}
+
+enumFromToS :: (Enum a, Prelude.Ord a, Monad m)
+            => a
+            -> a
+            -> Stream m a ()
+enumFromToS x0 y =
+    Stream step (return x0)
+  where
+    step x = return $ if x Prelude.> y
+        then Stop ()
+        else Emit (Prelude.succ x) x
+{-# INLINE [1] enumFromToS #-}
+{-# RULES "conduit: enumFromToS_int"
+    forall (x :: Int). enumFromToS x = enumFromToS_int x
+  #-}
+
+enumFromToS_int :: (Prelude.Integral a, Monad m) => a -> a -> Stream m a ()
+enumFromToS_int x0 y = x0 `seq` y `seq` Stream step (return x0)
+  where
+    step x | x <= y    = return $ Emit (x Prelude.+ 1) x
+           | otherwise = return $ Stop ()
+{-# INLINE enumFromToS_int #-}
+
+-- | A strict left fold.
+--
+-- Subject to fusion
+--
+-- Since 0.3.0
+fold :: Monad m
+     => (b -> a -> b)
+     -> b
+     -> Consumer' a m b
+fold f x = ConduitM' (foldC f x) (Just (foldS f x))
+{-# INLINE fold #-}
+
+foldC :: Monad m
+      => (b -> a -> b)
+      -> b
+      -> Consumer a m b
+foldC f =
+    loop
+  where
+    loop !accum = await >>= maybe (return accum) (loop . f accum)
+{-# INLINE foldC #-}
+
+foldS :: Monad m => (b -> a -> b) -> b -> Stream m a () -> Stream m o b
+foldS f b0 (Stream step ms0) =
+    Stream step' (liftM (b0, ) ms0)
+  where
+    step' (!b, s) = do
+        res <- step s
+        return $ case res of
+            Stop () -> Stop b
+            Skip s' -> Skip (b, s')
+            Emit s' a -> Skip (f b a, s')
+{-# INLINE foldS #-}
+
+-- | Apply a transformation to all values in a stream.
+--
+-- Subject to fusion
+--
+-- Since 0.3.0
+map :: Monad m => (a -> b) -> Conduit' a m b
+map f = ConduitM' (mapC f) (Just (mapS f))
+{-# INLINE map #-}
+
+mapC :: Monad m => (a -> b) -> Conduit a m b
+mapC f = awaitForever $ yield . f
+{-# INLINE mapC #-}
+
+mapS :: Monad m => (a -> b) -> Stream m a r -> Stream m b r
+mapS f (Stream step ms0) =
+    Stream step' ms0
+  where
+    step' s = do
+        res <- step s
+        return $ case res of
+            Stop r -> Stop r
+            Emit s' a -> Emit s' (f a)
+            Skip s' -> Skip s'
+{-# INLINE mapS #-}
+
+{-
 
 -- TODO:
 --
@@ -551,34 +676,6 @@ head = await
 -- Since 0.3.0
 peek :: Monad m => Consumer a m (Maybe a)
 peek = await >>= maybe (return Nothing) (\x -> leftover x >> return (Just x))
-
--- | Apply a transformation to all values in a stream.
---
--- Subject to fusion
---
--- Since 0.3.0
-map :: Monad m => (a -> b) -> Conduit a m b
-map = mapC
-{-# INLINE [0] map #-}
-{-# RULES "conduit: unstream map" forall f.
-    map f = unstream (streamConduit (mapC f) (mapS f))
-  #-}
-
-mapC :: Monad m => (a -> b) -> Conduit a m b
-mapC f = awaitForever $ yield . f
-{-# INLINE mapC #-}
-
-mapS :: Monad m => (a -> b) -> Stream m a r -> Stream m b r
-mapS f (Stream step ms0) =
-    Stream step' ms0
-  where
-    step' s = do
-        res <- step s
-        return $ case res of
-            Stop r -> Stop r
-            Emit s' a -> Emit s' (f a)
-            Skip s' -> Skip s'
-{-# INLINE mapS #-}
 
 -- Since a Source never has any leftovers, fusion rules on it are safe.
 {-
@@ -1162,3 +1259,5 @@ instance Prelude.Num a => Monoid (Sum a) where
   mappend (Sum x) (Sum y) = Sum $ x Prelude.+ y
 
 #endif
+
+-}
