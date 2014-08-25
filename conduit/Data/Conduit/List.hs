@@ -108,13 +108,13 @@ import qualified Data.Maybe
 #endif
 
 data ConduitM' i o m r = ConduitM'
-    { getConduitM :: !(ConduitM i o m r)
-    , getStream :: !(ConduitStream i o m r)
+    { getConduitM :: (ConduitM i o m r)
+    , getStream :: (ConduitStream i o m r)
     }
 
 data ConduitStream i o m r where
     NoStream      ::                                     ConduitStream i o m r
-    ConduitStream :: !(Stream m i () -> Stream m o r) -> ConduitStream i o m r
+    ConduitStream :: (Stream m i () -> Stream m o r) -> ConduitStream i o m r
 --    StreamSource  :: !(Stream m o ()) ->                 ConduitStream i o m ()
 --    IdentSource   :: !(Stream Identity o ()) ->          ConduitStream i o m ()
 
