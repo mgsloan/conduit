@@ -29,8 +29,8 @@ data Step s o r
     | Stop r
 
 data Stream m o r = forall s. Stream
-    (s -> m (Step s o r))
-    (m s)
+    !(s -> m (Step s o r))
+    !(m s)
 
 data StreamConduit i o m r = StreamConduit
     (ConduitM i o m r)

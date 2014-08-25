@@ -5,6 +5,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE GADTs #-}
 -- | Higher-level functions to interact with the elements of a stream. Most of
 -- these are based on list functions.
 --
@@ -16,7 +17,7 @@
 -- modules.
 module Data.Conduit.List
     ( -- * Sources
-      enumFromTo, fold, map, Producer', Consumer', Conduit', ConduitM' (..)
+      enumFromTo, fold, map, Producer', Consumer', Conduit', ConduitM' (..), Source', Sink', ConduitStream(..)
 {-
       sourceList
     , sourceNull
@@ -91,14 +92,15 @@ import Data.Monoid (Monoid, mempty, mappend)
 import qualified Data.Foldable as F
 import Data.Conduit
 import qualified Data.Conduit.Internal as CI
-import Data.Conduit.Internal.Fusion
+import Data.Conduit.Internal.Fusion (Stream(..), Step(..))
 import Control.Monad (when, (<=<), liftM, void)
 import Control.Monad.Trans.Class (lift)
+import Control.Monad.Identity (Identity, runIdentity)
+import Data.Void
 
 #if QUICKCHECK
 import Test.Hspec
 import Test.QuickCheck
-import Control.Monad.Identity (Identity, runIdentity)
 import qualified Data.List
 import qualified Data.Foldable
 import qualified Safe
@@ -106,14 +108,25 @@ import qualified Data.Maybe
 #endif
 
 data ConduitM' i o m r = ConduitM'
-    !(ConduitM i o m r)
-    !(Maybe (Stream m i () -> Stream m o r))
+    { getConduitM :: !(ConduitM i o m r)
+    , getStream :: !(ConduitStream i o m r)
+    }
+
+data ConduitStream i o m r where
+    NoStream      ::                                     ConduitStream i o m r
+    ConduitStream :: !(Stream m i () -> Stream m o r) -> ConduitStream i o m r
+--    StreamSource  :: !(Stream m o ()) ->                 ConduitStream i o m ()
+--    IdentSource   :: !(Stream Identity o ()) ->          ConduitStream i o m ()
 
 type Producer' m o = forall i. ConduitM' i o m ()
 
 type Consumer' i m r = forall o. ConduitM' i o m r
 
 type Conduit' i m o = ConduitM' i o m ()
+
+type Source' m o = ConduitM' () o m ()
+
+type Sink' i = ConduitM' i Void
 
 -- | Enumerate from a value to a final value, inclusive, via 'succ'.
 --
@@ -128,8 +141,7 @@ enumFromTo :: (Enum a, Prelude.Ord a, Monad m)
            => a
            -> a
            -> Producer' m a
---TODO: why isn't this enumFromToC?
-enumFromTo x y = ConduitM' (enumFromToC x y) (Just (\_ -> enumFromToS x y))
+enumFromTo x y = ConduitM' (enumFromToC x y) $ ConduitStream (\_ -> enumFromToS x y) -- IdentSource (enumFromToS x y)
 {-# INLINE enumFromTo #-}
 
 enumFromToC :: (Enum a, Prelude.Ord a, Monad m)
@@ -175,7 +187,7 @@ fold :: Monad m
      => (b -> a -> b)
      -> b
      -> Consumer' a m b
-fold f x = ConduitM' (foldC f x) (Just (foldS f x))
+fold f x = ConduitM' (foldC f x) $ ConduitStream (foldS f x)
 {-# INLINE fold #-}
 
 foldC :: Monad m
@@ -206,7 +218,7 @@ foldS f b0 (Stream step ms0) =
 --
 -- Since 0.3.0
 map :: Monad m => (a -> b) -> Conduit' a m b
-map f = ConduitM' (mapC f) (Just (mapS f))
+map f = ConduitM' (mapC f) $ ConduitStream (mapS f)
 {-# INLINE map #-}
 
 mapC :: Monad m => (a -> b) -> Conduit a m b
@@ -892,7 +904,7 @@ consumeC =
     loop front = await >>= maybe (return $ front []) (\x -> loop $ front . (x:))
 {-# INLINE consumeC #-}
 
-consumeS :: Monad m => Stream m a () -> Stream m o [a]
+consumeS :: Monad m => Stream m a () -> Stream m Void [a]
 consumeS (Stream step ms0) =
     Stream step' (liftM (id,) ms0)
   where
